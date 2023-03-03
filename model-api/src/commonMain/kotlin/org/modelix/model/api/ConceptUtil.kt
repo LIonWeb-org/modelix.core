@@ -19,6 +19,12 @@ fun IConcept.getAllConcepts(): List<IConcept> {
     return acc.toList()
 }
 
+fun IConcept.getAllSuperConcepts(): List<IConcept> {
+    val acc = LinkedHashSet<IConcept>()
+    getDirectSuperConcepts().forEach { collectConcepts(it, acc) }
+    return acc.toList()
+}
+
 private fun collectConcepts(concept: IConcept, acc: MutableSet<IConcept>) {
     if (acc.contains(concept)) return
     acc.add(concept)
