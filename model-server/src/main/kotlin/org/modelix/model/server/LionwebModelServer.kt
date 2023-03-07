@@ -158,14 +158,6 @@ class LionwebModelServer(val client: LocalModelClient) {
 
             respondVersion(mergedVersion)
         }
-        post("/generate-ids") {
-            val quantity = call.request.queryParameters["quantity"]?.toInt() ?: 1000
-            val ids = (client.idGenerator as IdGenerator).generate(quantity)
-            respondJson(buildJSONObject {
-                put("first", ids.first)
-                put("last", ids.last)
-            })
-        }
         get("/{repositoryId}/the-form") {
             val repositoryId = RepositoryId(call.parameters["repositoryId"]!!)
             val versionHash = client.asyncStore.get(repositoryId.getBranchReference().getKey())!!
@@ -178,6 +170,15 @@ class LionwebModelServer(val client: LocalModelClient) {
             }
 
             respondJson(subtreeAsJson(PNodeAdapter(formNode.id, TreePointer(version.tree)), version.hash))
+        }
+        post("/{repositoryId}/generate-ids") {
+            val quantity = call.request.queryParameters["quantity"]?.toInt() ?: 1000
+            val ids = (client.idGenerator as IdGenerator).generate(quantity)
+            val idStrings = ids.map { it.toString() }
+            respondJson(buildJSONObject {
+                put("serializationFormatVersion", "1")
+                put("freeIds", JSONArray().putAll(idStrings))
+            })
         }
         webSocket("/{repositoryId}/ws") {
             val repositoryId = RepositoryId(call.parameters["repositoryId"]!!)
