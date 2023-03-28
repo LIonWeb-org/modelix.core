@@ -21,6 +21,7 @@ import io.ktor.server.request.*
 import io.ktor.server.response.*
 import io.ktor.server.routing.*
 import io.ktor.server.websocket.*
+import io.ktor.util.*
 import io.ktor.websocket.*
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
@@ -305,7 +306,7 @@ class LionwebModelServer(val client: LocalModelClient) {
             val nodeId = it.getLong("id")
 
             if (!t.containsNode(nodeId)) {
-                val conceptId = decodeBase64Url(it.getString("concept"))
+                val conceptId = getMetaPointer(it.getJSONObject("concept")).key.decodeBase64Url()
                 t.addNewChild(ITree.ROOT_ID, ITree.DETACHED_NODES_ROLE, -1, nodeId, ConceptReference(conceptId))
             }
         }
@@ -321,12 +322,20 @@ class LionwebModelServer(val client: LocalModelClient) {
         oldChildren.subtract(movedChildren).forEach { t.deleteNode(it) }
     }
 
+    data class MetaPointer(val language: String, val version: Int, val key: String)
+
+    private fun getMetaPointer(json: JSONObject): MetaPointer {
+        return MetaPointer(json.getString("metamodel"), Integer.parseInt(json.getString("version")), json.getString("key"))
+    }
+
     private fun updateProperties(nodeData: JSONObject, t: IWriteTransaction) {
         val nodeId = nodeData.getLong("id")
 
         val missingProperties = t.getPropertyRoles(nodeId).toMutableSet()
 
-        nodeData.optJSONObject("properties")?.stringEntries()?.forEach { role, value ->
+        nodeData.optJSONArray("properties")?.asObjectList()?.forEach { it ->
+            val role = getMetaPointer(it.getJSONObject("property")).key.decodeBase64Url()
+            val value = it.optString("value")
             t.setProperty(nodeId, role, value)
             missingProperties.remove(role)
         }
@@ -339,9 +348,9 @@ class LionwebModelServer(val client: LocalModelClient) {
 
         val missingReferences = t.getReferenceRoles(nodeId).toMutableSet()
 
-        nodeData.optJSONObject("references")?.arrayEntries()?.forEach { (role, refs) ->
-            refs.forEach {
-                val ref = it as JSONObject
+        nodeData.getJSONArray("references").asSequence().filterIsInstance(JSONObject::class.java).forEach { it ->
+            val role = getMetaPointer(it.getJSONObject("reference")).key
+            it.optJSONArray("targets")?.asObjectList()?.forEachIndexed() { index, ref ->
                 val newTargetId = ref.getLong("reference")
                 t.setReferenceTarget(nodeId, role, LocalPNodeReference(newTargetId))
 
@@ -355,8 +364,9 @@ class LionwebModelServer(val client: LocalModelClient) {
     private fun updateChildren(nodeData: JSONObject, t: IWriteTransaction, moved: MutableSet<Long>) {
         val nodeId = nodeData.getLong("id")
 
-        nodeData.getJSONObject("children").arrayEntries().forEach { role, childIds ->
-            childIds.asLongList().forEachIndexed { index, childId -> t.moveChild(nodeId, role, index, childId); moved.add(childId) }
+        nodeData.getJSONArray("children").asSequence().filterIsInstance(JSONObject::class.java).forEach { it ->
+            val role = getMetaPointer(it.getJSONObject("containment")).key
+            it.getJSONArray("children").asLongList().forEachIndexed { index, childId -> t.moveChild(nodeId, role, index, childId); moved.add(childId) }
         }
     }
 
@@ -444,6 +454,7 @@ class LionwebModelServer(val client: LocalModelClient) {
     private fun subtreeAsJson(rootNode: PNodeAdapter, version: String): JSONObject {
         val json = JSONObject()
         json.put("serializationFormatVersion", "1")
+        json.put("metamodels", JSONArray())
         json.put("__version", version)
         json.put("nodes", rootNode.getDescendants(true).map(::node2json).toList())
         return json
@@ -462,13 +473,11 @@ class LionwebModelServer(val client: LocalModelClient) {
             json.put("id", node.nodeId.toString())
         }
 
-        val conceptId = node.getConceptReference()?.getUID()
-        if (conceptId != null) {
-            val encoded = encodeBase64Url(conceptId)
-            json.put("concept", encoded)
-        } else {
-            json.put("concept", JSONObject.NULL)
-        }
+        val conceptRef = node.getConceptReference()
+        val conceptId = conceptRef?.getUID()
+        val language = conceptRef?.tryResolve()?.language
+        val concept = metaPointer(language, conceptId ?: "null")
+        json.put("concept", concept)
 
         val parent = node.parent
         if (parent is PNodeAdapter) {
@@ -479,15 +488,18 @@ class LionwebModelServer(val client: LocalModelClient) {
             json.put("parent", JSONObject.NULL)
         }
 
-        val jsonProperties = JSONObject()
-        val jsonReferences = JSONObject()
-        val jsonChildren = JSONObject()
+        val jsonProperties = JSONArray()
+        val jsonReferences = JSONArray()
+        val jsonChildren = JSONArray()
         json.put("properties", jsonProperties)
         json.put("references", jsonReferences)
         json.put("children", jsonChildren)
 
         for (role in node.getPropertyRoles()) {
-            jsonProperties.put(role, node.getPropertyValue(role))
+            val prop = JSONObject()
+            prop.put("property", metaPointer(language, role))
+            prop.put("value", node.getPropertyValue(role))
+            jsonProperties.put(prop)
         }
 
         for (role in node.getReferenceRoles()) {
@@ -495,27 +507,42 @@ class LionwebModelServer(val client: LocalModelClient) {
 
             if (ref is PNodeReference) {
                 val refJson = JSONObject()
-                refJson.put("resolveInfo", JSONObject.NULL)
-                refJson.put("reference", ref.id)
-
-                jsonReferences.put(role, listOf(refJson))
+                refJson.put("reference", metaPointer(language, role))
+                val refRefJson = JSONObject()
+                refRefJson.put("resolveInfo", JSONObject.NULL)
+                refRefJson.put("reference", ref.id)
+                refJson.put("targets", listOf(refRefJson))
             } else if (ref != null) {
                 throw IllegalStateException("Don't know how to serialize reference of class ${ref.javaClass}")
             }
         }
 
         for (children in node.allChildren.groupBy { it.roleInParent }) {
-            jsonChildren.put(children.key ?: "null", children.value.map { (it as PNodeAdapter).nodeId.toString() })
+            val child = JSONObject()
+            child.put("containment", metaPointer(language, children.key ?: "null"))
+            child.put("children", children.value.map { (it as PNodeAdapter).nodeId.toString() })
+            jsonChildren.put(child)
         }
         return json
     }
 
-    private val base64UrlEncoding = BaseEncoding.base64Url().omitPadding()
-
-    private fun encodeBase64Url(input: String): String {
-        return base64UrlEncoding.encode(input.toByteArray(Charsets.US_ASCII))
+    private fun metaPointer(
+        language: ILanguage?,
+        key: String
+    ): JSONObject {
+        val metaPointer = JSONObject()
+        metaPointer.put("metamodel", language?.getUID()?.encodeBase64() ?: JSONObject.NULL)
+        metaPointer.put("version", 0.toString())
+        metaPointer.put("key", key.encodeBase64Url())
+        return metaPointer
     }
 
-    private fun decodeBase64Url(input: String): String =
-            base64UrlEncoding.decode(input).toString(Charsets.US_ASCII)
+    private val base64UrlEncoding = BaseEncoding.base64Url().omitPadding()
+
+    private fun String.encodeBase64Url(): String {
+        return base64UrlEncoding.encode(this.toByteArray(Charsets.US_ASCII))
+    }
+
+    private fun String.decodeBase64Url(): String =
+            base64UrlEncoding.decode(this).toString(Charsets.US_ASCII)
 }
